@@ -10,6 +10,7 @@ import wandb
 # Cấu hình đường dẫn dữ liệu từ Giai đoạn 1
 TRAIN_BIO_FILE = "./data/processed_bio/train_bio.json"
 DEV_BIO_FILE = "./data/processed_bio/dev_bio.json"
+WANDB_PROJECT = "BKEE_Event_Extraction_LREC2024"
 
 # ==========================================================
 # RUN 01: RULE-BASED TRIGGER (Exact Match từ điển)
@@ -18,6 +19,16 @@ def run_01_rule_based():
     print("\n" + "="*50)
     print("KHỞI CHẠY RUN 01: RULE-BASED TRIGGER")
     print("="*50)
+    
+    # Khởi tạo tracking W&B cho Run 01
+    wandb.init(
+        project=WANDB_PROJECT, 
+        name="run_01_rule_based_trigger",
+        config={
+            "architecture": "Rule-Based",
+            "method": "Exact Match Dictionary"
+        }
+    )
     
     # 1. Thu thập tất cả các từ là Trigger từ tập Train để bỏ vào từ điển
     trigger_vocab = set()
@@ -65,22 +76,36 @@ def run_01_rule_based():
     print(f"Recall    : {recall * 100:.2f}%")
     print(f"F1-score  : {f1_score * 100:.2f}%")
     print("="*50 + "\n")
+    
+    # Ghi log kết quả Summary và bảng dữ liệu lên W&B
+    wandb.log({
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score
+    })
+    
+    # Tạo bảng trực quan hóa trên giao diện W&B
+    results_table = wandb.Table(columns=["Metric", "Value"])
+    results_table.add_data("Precision", precision)
+    results_table.add_data("Recall", recall)
+    results_table.add_data("F1-Score", f1_score)
+    wandb.log({"Evaluation_Metrics": results_table})
+    
+    # Đóng phiên làm việc của Run 01 trước khi sang Run 02
+    wandb.finish()
     return f1_score
 
 
 # ==========================================================
 # RUN 02: BiLSTM-CRF TRIGGER (Học sâu có ràng buộc chuỗi)
 # ==========================================================
-# Cài đặt tầng CRF thủ công để không bị lỗi phụ thuộc thư viện ngoài trên Kaggle
 class SimpleCRF(nn.Module):
     def __init__(self, num_tags):
         super().__init__()
         self.num_tags = num_tags
-        # Ma trận chuyển trạng thái giữa các nhãn (transition matrix)
         self.transitions = nn.Parameter(torch.randn(num_tags, num_tags))
         
     def forward(self, emissions, tags, mask):
-        # Tính toán log-likelihood xấp xỉ đơn giản cho bài toán phân lớp chuỗi
         log_probs = torch.log_softmax(emissions, dim=-1)
         tags_expanded = tags.unsqueeze(-1)
         gold_scores = torch.gather(log_probs, dim=-1, index=tags_expanded).squeeze(-1)
@@ -122,12 +147,23 @@ class BiLSTM_CRF(nn.Module):
         return emissions
 
 def run_02_bilstm_crf():
-    print("="*50)
+    print("\n" + "="*50)
     print("KHỞI CHẠY RUN 02: BiLSTM-CRF TRIGGER")
     print("="*50)
     
     # Khởi tạo đồng bộ Weights & Biases cho Run 02
-    wandb.init(project="BKEE_Event_Extraction_LREC2024", name="run_02_bilstm_crf_trigger")
+    wandb.init(
+        project=WANDB_PROJECT, 
+        name="run_02_bilstm_crf_trigger",
+        config={
+            "architecture": "BiLSTM-CRF",
+            "learning_rate": 0.002,
+            "batch_size": 32,
+            "epochs": 5,
+            "embed_dim": 128,
+            "hidden_dim": 128
+        }
+    )
     
     # Xây dựng bộ từ vựng ánh xạ ID cố định
     word_to_idx = {"<PAD>": 0, "<UNK>": 1}
@@ -185,13 +221,17 @@ def run_02_bilstm_crf():
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
         
         # Đẩy dữ liệu log trực quan lên đồ thị W&B
-        wandb.log({"epoch": epoch+1, "loss": epoch_loss/len(train_loader), "val_f1": f1})
+        wandb.log({
+            "epoch": epoch + 1, 
+            "loss": epoch_loss / len(train_loader), 
+            "val_f1": f1
+        })
         print(f"Epoch {epoch+1}/5 - Loss: {epoch_loss/len(train_loader):.4f} - Dev F1: {f1*100:.2f}%")
         
     wandb.finish()
     print("-> Hoàn thành huấn luyện Run 02!")
 
 if __name__ == "__main__":
-    # Chạy lần lượt Run 01 và Run 02
+    # Chạy tuần tự và độc lập hai thí nghiệm lên W&B
     run_01_rule_based()
     run_02_bilstm_crf()
