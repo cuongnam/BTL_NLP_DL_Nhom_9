@@ -12,10 +12,10 @@ from transformers import (
 import evaluate
 import wandb
 
-# Ép buộc chạy đơn card GPU ổn định nhất trên Kaggle
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 MODEL_NAME = "vinai/phobert-base-v2"
 
+# Đã thay đổi: Tự động căn chỉnh nhãn thủ công không dùng word_ids()
 class BKEEPhoBERTDataset(Dataset):
     def __init__(self, file_path, tokenizer, label_to_idx, max_len=128):
         self.examples = []
@@ -27,28 +27,47 @@ class BKEEPhoBERTDataset(Dataset):
                 tokens = item["tokens"]
                 labels = item["labels"]
                 
-                # Tokenize có kèm căn chỉnh mảng từ (is_split_into_words=True)
-                encoding = tokenizer(
-                    tokens,
-                    is_split_into_words=True,
-                    max_length=max_len,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                )
+                # Khởi tạo chuỗi ID với token [CLS] ở đầu
+                input_ids = [tokenizer.cls_token_id]
+                label_ids = [-100] # -100 để hàm Loss của PyTorch bỏ qua
                 
-                # Ánh xạ nhãn BIO theo các sub-tokens của PhoBERT
-                word_ids = encoding.word_ids(batch_index=0)
-                aligned_labels = []
-                for word_idx in word_ids:
-                    if word_idx is None:
-                        aligned_labels.append(-100) # Bỏ qua các token đặc biệt khi tính Loss
-                    else:
-                        aligned_labels.append(label_to_idx.get(labels[word_idx], label_to_idx["O"]))
+                # Căn chỉnh nhãn thủ công cho từng từ
+                for word, label in zip(tokens, labels):
+                    # Tách từ thành các sub-tokens
+                    word_tokens = tokenizer.encode(word, add_special_tokens=False)
+                    if not word_tokens:
+                        continue
                         
-                item_dict = {key: val.squeeze(0) for key, val in encoding.items()}
-                item_dict["labels"] = torch.tensor(aligned_labels, dtype=torch.long)
-                self.examples.append(item_dict)
+                    input_ids.extend(word_tokens)
+                    
+                    # Gán nhãn gốc cho sub-token đầu tiên của từ
+                    label_ids.append(label_to_idx.get(label, label_to_idx["O"]))
+                    
+                    # Gán nhãn -100 cho các sub-tokens còn lại (nếu từ bị tách làm nhiều mảnh)
+                    if len(word_tokens) > 1:
+                        label_ids.extend([-100] * (len(word_tokens) - 1))
+                        
+                # Thêm token [SEP] ở cuối
+                input_ids.append(tokenizer.sep_token_id)
+                label_ids.append(-100)
+                
+                # Cắt gọn (Truncation) nếu vượt quá max_len
+                input_ids = input_ids[:max_len]
+                label_ids = label_ids[:max_len]
+                
+                # Padding cho đủ max_len
+                attention_mask = [1] * len(input_ids)
+                pad_len = max_len - len(input_ids)
+                
+                input_ids.extend([tokenizer.pad_token_id] * pad_len)
+                label_ids.extend([-100] * pad_len)
+                attention_mask.extend([0] * pad_len)
+                
+                self.examples.append({
+                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                    "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+                    "labels": torch.tensor(label_ids, dtype=torch.long)
+                })
                 
     def __len__(self): return len(self.examples)
     def __getitem__(self, idx): return self.examples[idx]
@@ -78,14 +97,14 @@ def get_compute_metrics(idx_to_label):
 
 def run_03_phobert_pure():
     print("\n" + "="*50)
-    print("KHỞI CHẠY RUN 03: PHOBERT PURE TRIGGER")
+    print("KHỞI CHẠY RUN 03: PHOBERT PURE TRIGGER (TOKEN CLASSIFICATION)")
     print("="*50)
     
     label_list = ["O", "B-TRIGGER", "I-TRIGGER"]
     label_to_idx = {l: i for i, l in enumerate(label_list)}
     idx_to_label = {i: l for i, l in enumerate(label_list)}
     
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
     model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME, num_labels=len(label_list))
     
     train_dataset = BKEEPhoBERTDataset("./data/processed_bio/train_bio.json", tokenizer, label_to_idx)
@@ -97,7 +116,7 @@ def run_03_phobert_pure():
         learning_rate=3e-5,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
-        num_train_epochs=3, # Chạy 3 epochs tối ưu tốc độ và tránh Overfitting
+        num_train_epochs=3,
         weight_decay=0.01,
         logging_steps=50,
         report_to="wandb",
@@ -117,10 +136,9 @@ def run_03_phobert_pure():
 
 def run_04_phobert_joint():
     print("\n" + "="*50)
-    print("KHỞI CHẠY RUN 04: PHOBERT JOINT LEARNING")
+    print("KHỞI CHẠY RUN 04: PHOBERT JOINT LEARNING (TRIGGER + EVENT TYPE)")
     print("="*50)
     
-    # Tự động thu thập toàn bộ tập nhãn Gộp (Joint) từ tập dữ liệu Giai đoạn 1
     label_set = set(["O"])
     with open("./data/processed_joint/train_joint.json", "r", encoding="utf-8") as f:
         for line in f:
@@ -131,7 +149,7 @@ def run_04_phobert_joint():
     label_to_idx = {l: i for i, l in enumerate(label_list)}
     idx_to_label = {i: l for i, l in enumerate(label_list)}
     
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
     model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME, num_labels=len(label_list))
     
     train_dataset = BKEEPhoBERTDataset("./data/processed_joint/train_joint.json", tokenizer, label_to_idx)
@@ -162,6 +180,5 @@ def run_04_phobert_joint():
     wandb.finish()
 
 if __name__ == "__main__":
-    # Đảm bảo đăng nhập W&B trước (Hoặc notebook đã nhận diện qua môi trường)
     run_03_phobert_pure()
     run_04_phobert_joint()
