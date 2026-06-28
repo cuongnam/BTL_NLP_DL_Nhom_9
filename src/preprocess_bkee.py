@@ -122,7 +122,7 @@ def print_sample(output_path, n=3):
 
 if __name__ == "__main__":
     # Đường dẫn dữ liệu gốc BKEE
-    DATA_DIR = "./processed"
+    DATA_DIR = "./data/processed"
     SPLITS = ["train", "dev", "test"]
 
     # 1. Tạo dữ liệu BIO thông thường (Run 01, 02, 03)
