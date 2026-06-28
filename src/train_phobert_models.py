@@ -14,6 +14,7 @@ import wandb
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 MODEL_NAME = "vinai/phobert-base-v2"
+
 WANDB_PROJECT = "BKEE_Event_Extraction_LREC2024"
 # Hàm hỗ trợ cấu hình TrainingArguments để chỉ lưu Best Model
 def get_training_args(output_dir, run_name):
