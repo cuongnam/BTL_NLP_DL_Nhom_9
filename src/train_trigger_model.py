@@ -1,237 +1,303 @@
-import os
+"""
+train_trigger_model.py - Huấn luyện Run 01 (Rule-based) và Run 02 (BiLSTM-CRF)
+
+Sửa so với phiên bản cũ:
+  1. [Run 01] Đổi sang đánh giá F1 theo SPAN (seqeval) thay vì token-level,
+     để kết quả so sánh được với Run 03/04.
+  2. [Run 02] Thay SimpleCRF giả bằng torchcrf thực sự (có Viterbi decoding).
+  3. [Run 02] Bổ sung seqeval để đánh giá F1 theo span.
+  4. Thêm seed cố định để tái lập kết quả.
+
+Yêu cầu cài thêm:
+  pip install torchcrf seqeval
+"""
+
 import json
+import os
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
 import wandb
+from torch.utils.data import DataLoader, Dataset
+from torchcrf import CRF          # pip install torchcrf
+from seqeval.metrics import f1_score, precision_score, recall_score
 
-# Cấu hình đường dẫn dữ liệu từ Giai đoạn 1
+# ─── Cấu hình chung ──────────────────────────────────────────────────────────
 TRAIN_BIO_FILE = "./data/processed_bio/train_bio.json"
-DEV_BIO_FILE = "./data/processed_bio/dev_bio.json"
-WANDB_PROJECT = "BKEE_Event_Extraction_LREC2024"
+DEV_BIO_FILE   = "./data/processed_bio/dev_bio.json"
+WANDB_PROJECT  = "BKEE_Event_Extraction_LREC2024"
+SEED           = 42
 
-# ==========================================================
-# RUN 01: RULE-BASED TRIGGER (Exact Match từ điển)
-# ==========================================================
+LABEL_LIST    = ["O", "B-TRIGGER", "I-TRIGGER"]
+LABEL_TO_IDX  = {l: i for i, l in enumerate(LABEL_LIST)}
+IDX_TO_LABEL  = {i: l for i, l in enumerate(LABEL_LIST)}
+
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN 01 — Rule-Based Trigger (Exact Match từ điển)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_span_f1(pred_label_seqs, gold_label_seqs):
+    """Tính P/R/F1 theo span dùng seqeval."""
+    p = precision_score(gold_label_seqs, pred_label_seqs)
+    r = recall_score(gold_label_seqs, pred_label_seqs)
+    f = f1_score(gold_label_seqs, pred_label_seqs)
+    return p, r, f
+
+
 def run_01_rule_based():
-    print("\n" + "="*50)
+    print("\n" + "=" * 60)
     print("KHỞI CHẠY RUN 01: RULE-BASED TRIGGER")
-    print("="*50)
-    
-    # Khởi tạo tracking W&B cho Run 01
+    print("=" * 60)
+
     wandb.init(
-        project=WANDB_PROJECT, 
+        project=WANDB_PROJECT,
         name="run_01_rule_based_trigger",
-        config={
-            "architecture": "Rule-Based",
-            "method": "Exact Match Dictionary"
-        }
+        config={"architecture": "Rule-Based", "method": "Exact Match Dictionary"},
     )
-    
-    # 1. Thu thập tất cả các từ là Trigger từ tập Train để bỏ vào từ điển
+
+    # 1. Xây dựng từ điển trigger từ tập Train
     trigger_vocab = set()
     with open(TRAIN_BIO_FILE, "r", encoding="utf-8") as f:
         for line in f:
             item = json.loads(line.strip())
             for token, label in zip(item["tokens"], item["labels"]):
-                if label.startswith("B-") or label.startswith("I-"):
+                if label != "O":
                     trigger_vocab.add(token.lower())
-                    
-    print(f"-> Đã xây dựng xong từ điển chứa {len(trigger_vocab)} từ khóa kích hoạt.")
-    
-    # 2. Đánh giá trên tập Dev
-    total_gold_triggers = 0
-    total_predicted_triggers = 0
-    correct_predictions = 0
-    
+
+    print(f"  Từ điển trigger: {len(trigger_vocab)} từ")
+
+    # 2. Dự đoán và đánh giá theo SPAN trên tập Dev
+    all_preds = []
+    all_golds = []
+
     with open(DEV_BIO_FILE, "r", encoding="utf-8") as f:
         for line in f:
             item = json.loads(line.strip())
-            tokens = item["tokens"]
+            tokens    = item["tokens"]
             gold_labels = item["labels"]
-            
-            # Dự đoán theo luật khớp từ điển thô
-            pred_labels = ["O"] * len(tokens)
-            for i, token in enumerate(tokens):
+
+            # Dự đoán: token nào có trong vocab → B-TRIGGER
+            pred_labels = []
+            for token in tokens:
                 if token.lower() in trigger_vocab:
-                    pred_labels[i] = "B-TRIGGER"
-            
-            # Tính toán ma trận lỗi ở mức độ Token
-            for pred, gold in zip(pred_labels, gold_labels):
-                if gold != "O": 
-                    total_gold_triggers += 1
-                if pred != "O": 
-                    total_predicted_triggers += 1
-                if pred != "O" and gold != "O": 
-                    correct_predictions += 1
-                    
-    precision = correct_predictions / total_predicted_triggers if total_predicted_triggers > 0 else 0
-    recall = correct_predictions / total_gold_triggers if total_gold_triggers > 0 else 0
-    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    print("\n--- KẾT QUẢ NGHIỆM THU RUN 01 ---")
-    print(f"Precision : {precision * 100:.2f}%")
-    print(f"Recall    : {recall * 100:.2f}%")
-    print(f"F1-score  : {f1_score * 100:.2f}%")
-    print("="*50 + "\n")
-    
-    # Ghi log kết quả Summary và bảng dữ liệu lên W&B
-    wandb.log({
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1_score
-    })
-    
-    # Tạo bảng trực quan hóa trên giao diện W&B
-    results_table = wandb.Table(columns=["Metric", "Value"])
-    results_table.add_data("Precision", precision)
-    results_table.add_data("Recall", recall)
-    results_table.add_data("F1-Score", f1_score)
-    wandb.log({"Evaluation_Metrics": results_table})
-    
-    # Đóng phiên làm việc của Run 01 trước khi sang Run 02
+                    pred_labels.append("B-TRIGGER")
+                else:
+                    pred_labels.append("O")
+
+            all_preds.append(pred_labels)
+            all_golds.append(gold_labels)
+
+    precision, recall, f1 = compute_span_f1(all_preds, all_golds)
+
+    print(f"\n--- KẾT QUẢ RUN 01 (Span-level seqeval) ---")
+    print(f"  Precision : {precision * 100:.2f}%")
+    print(f"  Recall    : {recall    * 100:.2f}%")
+    print(f"  F1-score  : {f1        * 100:.2f}%")
+
+    wandb.log({"precision": precision, "recall": recall, "f1_score": f1})
     wandb.finish()
-    return f1_score
+    return f1
 
 
-# ==========================================================
-# RUN 02: BiLSTM-CRF TRIGGER (Học sâu có ràng buộc chuỗi)
-# ==========================================================
-class SimpleCRF(nn.Module):
-    def __init__(self, num_tags):
-        super().__init__()
-        self.num_tags = num_tags
-        self.transitions = nn.Parameter(torch.randn(num_tags, num_tags))
-        
-    def forward(self, emissions, tags, mask):
-        log_probs = torch.log_softmax(emissions, dim=-1)
-        tags_expanded = tags.unsqueeze(-1)
-        gold_scores = torch.gather(log_probs, dim=-1, index=tags_expanded).squeeze(-1)
-        return -torch.mean(gold_scores * mask.float())
+# ═══════════════════════════════════════════════════════════════════════════════
+# RUN 02 — BiLSTM + CRF thực sự (torchcrf)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class BKEETriggerDataset(Dataset):
-    def __init__(self, file_path, word_to_idx, label_to_idx):
+    def __init__(self, file_path, word_to_idx):
         self.features = []
-        self.labels = []
+        self.labels   = []
+
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
-                item = json.loads(line.strip())
-                w_ids = [word_to_idx.get(w.lower(), word_to_idx["<UNK>"]) for w in item["tokens"]]
-                l_ids = [label_to_idx.get(l, label_to_idx["O"]) for l in item["labels"]]
+                item   = json.loads(line.strip())
+                w_ids  = [word_to_idx.get(w.lower(), word_to_idx["<UNK>"]) for w in item["tokens"]]
+                l_ids  = [LABEL_TO_IDX.get(l, LABEL_TO_IDX["O"]) for l in item["labels"]]
                 self.features.append(torch.tensor(w_ids, dtype=torch.long))
                 self.labels.append(torch.tensor(l_ids, dtype=torch.long))
-                
-    def __len__(self): return len(self.features)
-    def __getitem__(self, idx): return self.features[idx], self.labels[idx]
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
 
 def collate_fn(batch):
     sequences, labels = zip(*batch)
-    padded_seqs = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=0)
-    padded_labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0)
-    return padded_seqs, padded_labels
+    padded_seqs   = nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=0)
+    padded_labels = nn.utils.rnn.pad_sequence(labels,    batch_first=True, padding_value=0)
+    mask = (padded_seqs != 0)  # True ở vị trí thực, False ở padding
+    return padded_seqs, padded_labels, mask
+
 
 class BiLSTM_CRF(nn.Module):
-    def __init__(self, vocab_size, num_tags, embed_dim=128, hidden_dim=128):
+    def __init__(self, vocab_size, num_tags, embed_dim=128, hidden_dim=256, dropout=0.3):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim // 2, num_layers=1, bidirectional=True, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, num_tags)
-        self.crf = SimpleCRF(num_tags)
-        
-    def forward(self, x):
-        embeds = self.embedding(x)
+        self.dropout   = nn.Dropout(dropout)
+        self.lstm      = nn.LSTM(
+            embed_dim, hidden_dim // 2,
+            num_layers=2, bidirectional=True,
+            batch_first=True, dropout=dropout,
+        )
+        self.fc  = nn.Linear(hidden_dim, num_tags)
+        self.crf = CRF(num_tags, batch_first=True)   # torchcrf — CRF thực sự
+
+    def forward(self, x, mask):
+        """Trả về negative log-likelihood (dùng làm loss khi training)."""
+        embeds    = self.dropout(self.embedding(x))
         lstm_out, _ = self.lstm(embeds)
-        emissions = self.fc(lstm_out)
+        emissions = self.fc(self.dropout(lstm_out))
         return emissions
 
+    def loss(self, emissions, tags, mask):
+        # CRF forward: trả về log-likelihood → negate để thành loss
+        return -self.crf(emissions, tags, mask=mask, reduction="mean")
+
+    def decode(self, emissions, mask):
+        """Viterbi decoding — trả về list of list of int."""
+        return self.crf.decode(emissions, mask=mask)
+
+
+def evaluate_bilstm(model, loader, device):
+    """Đánh giá F1 theo span dùng seqeval."""
+    model.eval()
+    all_preds = []
+    all_golds = []
+
+    with torch.no_grad():
+        for seqs, labels, mask in loader:
+            seqs, mask = seqs.to(device), mask.to(device)
+            emissions  = model(seqs, mask)
+            pred_ids   = model.decode(emissions, mask)   # list of list
+
+            # Chuyển từ id → nhãn chuỗi
+            labels_np = labels.numpy()
+            mask_np   = mask.cpu().numpy()
+
+            for i, pred_seq in enumerate(pred_ids):
+                length    = int(mask_np[i].sum())
+                pred_lbls = [IDX_TO_LABEL[p] for p in pred_seq[:length]]
+                gold_lbls = [IDX_TO_LABEL[labels_np[i][j]] for j in range(length)]
+                all_preds.append(pred_lbls)
+                all_golds.append(gold_lbls)
+
+    p = precision_score(all_golds, all_preds)
+    r = recall_score(all_golds, all_preds)
+    f = f1_score(all_golds, all_preds)
+    return p, r, f
+
+
 def run_02_bilstm_crf():
-    print("\n" + "="*50)
+    print("\n" + "=" * 60)
     print("KHỞI CHẠY RUN 02: BiLSTM-CRF TRIGGER")
-    print("="*50)
-    
-    # Khởi tạo đồng bộ Weights & Biases cho Run 02
+    print("=" * 60)
+
+    set_seed()
+
+    config = {
+        "architecture": "BiLSTM-CRF",
+        "learning_rate": 0.001,
+        "batch_size": 32,
+        "epochs": 10,
+        "embed_dim": 128,
+        "hidden_dim": 256,
+        "dropout": 0.3,
+        "optimizer": "Adam",
+    }
+
     wandb.init(
-        project=WANDB_PROJECT, 
+        project=WANDB_PROJECT,
         name="run_02_bilstm_crf_trigger",
-        config={
-            "architecture": "BiLSTM-CRF",
-            "learning_rate": 0.002,
-            "batch_size": 32,
-            "epochs": 5,
-            "embed_dim": 128,
-            "hidden_dim": 128
-        }
+        config=config,
     )
-    
-    # Xây dựng bộ từ vựng ánh xạ ID cố định
+
+    # Xây dựng từ vựng từ tập Train
     word_to_idx = {"<PAD>": 0, "<UNK>": 1}
-    label_to_idx = {"O": 0, "B-TRIGGER": 1, "I-TRIGGER": 2}
-    
     with open(TRAIN_BIO_FILE, "r", encoding="utf-8") as f:
         for line in f:
             for w in json.loads(line.strip())["tokens"]:
                 if w.lower() not in word_to_idx:
                     word_to_idx[w.lower()] = len(word_to_idx)
-                    
-    train_set = BKEETriggerDataset(TRAIN_BIO_FILE, word_to_idx, label_to_idx)
-    dev_set = BKEETriggerDataset(DEV_BIO_FILE, word_to_idx, label_to_idx)
-    
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True, collate_fn=collate_fn)
-    dev_loader = DataLoader(dev_set, batch_size=32, shuffle=False, collate_fn=collate_fn)
-    
+
+    print(f"  Kích thước từ vựng: {len(word_to_idx)}")
+
+    train_set = BKEETriggerDataset(TRAIN_BIO_FILE, word_to_idx)
+    dev_set   = BKEETriggerDataset(DEV_BIO_FILE,   word_to_idx)
+
+    train_loader = DataLoader(train_set, batch_size=config["batch_size"], shuffle=True,  collate_fn=collate_fn)
+    dev_loader   = DataLoader(dev_set,   batch_size=config["batch_size"], shuffle=False, collate_fn=collate_fn)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BiLSTM_CRF(len(word_to_idx), len(label_to_idx)).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.002)
-    
-    # Huấn luyện mô hình mạng nơ-ron trong 5 Epochs
-    for epoch in range(5):
+    print(f"  Thiết bị: {device}")
+
+    model     = BiLSTM_CRF(len(word_to_idx), len(LABEL_LIST),
+                            embed_dim=config["embed_dim"],
+                            hidden_dim=config["hidden_dim"],
+                            dropout=config["dropout"]).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=2, factor=0.5)
+
+    best_f1 = 0.0
+
+    for epoch in range(config["epochs"]):
         model.train()
-        epoch_loss = 0
-        for seqs, labels in train_loader:
-            seqs, labels = seqs.to(device), labels.to(device)
-            mask = (seqs != 0)
-            
+        epoch_loss = 0.0
+
+        for seqs, labels, mask in train_loader:
+            seqs, labels, mask = seqs.to(device), labels.to(device), mask.to(device)
+
             optimizer.zero_grad()
-            emissions = model(seqs)
-            loss = model.crf(emissions, labels, mask)
+            emissions = model(seqs, mask)
+            loss      = model.loss(emissions, labels, mask)
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             epoch_loss += loss.item()
-            
-        # Đánh giá nhanh F1 trên tập Dev cuối mỗi Epoch
-        model.eval()
-        correct, pred_total, gold_total = 0, 0, 0
-        with torch.no_grad():
-            for seqs, labels in dev_loader:
-                seqs = seqs.to(device)
-                emissions = model(seqs)
-                preds = torch.argmax(emissions, dim=-1).cpu().numpy()
-                golds = labels.numpy()
-                
-                for p_seq, g_seq in zip(preds, golds):
-                    for p, g in zip(p_seq, g_seq):
-                        if g != 0: gold_total += 1
-                        if p != 0: pred_total += 1
-                        if p != 0 and g != 0: correct += 1
-                        
-        p = correct / pred_total if pred_total > 0 else 0
-        r = correct / gold_total if gold_total > 0 else 0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
-        
-        # Đẩy dữ liệu log trực quan lên đồ thị W&B
+
+        avg_loss = epoch_loss / len(train_loader)
+
+        # Đánh giá trên Dev
+        p, r, f1 = evaluate_bilstm(model, dev_loader, device)
+        scheduler.step(f1)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            torch.save(model.state_dict(), "./saved_models/run_02_best.pt")
+
         wandb.log({
-            "epoch": epoch + 1, 
-            "loss": epoch_loss / len(train_loader), 
-            "val_f1": f1
+            "epoch": epoch + 1,
+            "train/loss": avg_loss,
+            "eval/precision": p,
+            "eval/recall": r,
+            "eval/f1": f1,
+            "eval/best_f1": best_f1,
         })
-        print(f"Epoch {epoch+1}/5 - Loss: {epoch_loss/len(train_loader):.4f} - Dev F1: {f1*100:.2f}%")
-        
+
+        print(f"  Epoch {epoch+1:02d}/{config['epochs']} | "
+              f"Loss: {avg_loss:.4f} | P: {p*100:.1f}% | R: {r*100:.1f}% | F1: {f1*100:.1f}% | Best: {best_f1*100:.1f}%")
+
+    print(f"\n  Best F1 trên Dev: {best_f1 * 100:.2f}%")
     wandb.finish()
-    print("-> Hoàn thành huấn luyện Run 02!")
+    return best_f1
+
 
 if __name__ == "__main__":
-    # Chạy tuần tự và độc lập hai thí nghiệm lên W&B
+    os.makedirs("./saved_models", exist_ok=True)
+    os.makedirs("./data/processed_bio", exist_ok=True)
+
     run_01_rule_based()
     run_02_bilstm_crf()
