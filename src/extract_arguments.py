@@ -38,45 +38,52 @@ class BKEEArgumentMRCDataset(Dataset):
                 for event in doc.get("event_mentions", []):
                     event_type = event["event_type"]
                     trigger = event["trigger"]
-                    trigger_text = " ".join(tokens[trigger["start"]:trigger["end"]])
                     
-                    # 1. Tạo chuỗi mồi (Prompt) cung cấp ngữ cảnh cho mô hình
+                    # Lấy start/end của trigger an toàn
+                    t_start = trigger.get("start", trigger.get("start_char", 0))
+                    t_end = trigger.get("end", trigger.get("end_char", 0))
+                    trigger_text = " ".join(tokens[t_start:t_end])
+                    
+                    # 1. Tạo chuỗi mồi (Prompt)
                     prompt_text = f"Sự kiện: {event_type} | Từ khóa: {trigger_text}"
                     prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
                     
-                    # 2. Xử lý câu văn gốc và gán nhãn BIO cho các Argument (Đối số)
-                    sentence_input_ids = []
-                    sentence_label_ids = []
-                    
-                    # Khởi tạo nhãn 'O' cho toàn bộ câu
+                    # 2. Xử lý câu văn gốc và gán nhãn BIO cho các Argument
                     arg_labels = ["O"] * len(tokens)
                     for arg in event.get("arguments", []):
                         role = arg["role"]
-                        start, end = arg["start"], arg["end"]
-                        if start < len(arg_labels):
-                            arg_labels[start] = f"B-{role}"
-                            for i in range(start + 1, end):
-                                if i < len(arg_labels):
-                                    arg_labels[i] = f"I-{role}"
+                        # Lấy start/end của argument an toàn
+                        start = arg.get("start", arg.get("start_char"))
+                        end = arg.get("end", arg.get("end_char"))
+                        
+                        if start is not None and end is not None:
+                            # Đảm bảo index nằm trong phạm vi tokens
+                            start = max(0, min(start, len(arg_labels)))
+                            end = max(0, min(end, len(arg_labels)))
+                            
+                            if start < len(arg_labels):
+                                arg_labels[start] = f"B-{role}"
+                                for i in range(start + 1, end):
+                                    if i < len(arg_labels):
+                                        arg_labels[i] = f"I-{role}"
                                     
-                    # Ánh xạ sub-words thủ công (Tránh lỗi Fast Tokenizer của PhoBERT)
+                    # Ánh xạ sub-words
+                    sentence_input_ids = []
+                    sentence_label_ids = []
                     for word, label in zip(tokens, arg_labels):
                         word_tokens = tokenizer.encode(word, add_special_tokens=False)
                         if not word_tokens: continue
                         sentence_input_ids.extend(word_tokens)
                         
-                        # Gán nhãn gốc cho sub-token đầu tiên, các mảnh sau gán -100
                         sentence_label_ids.append(label_to_idx.get(label, label_to_idx["O"]))
                         if len(word_tokens) > 1:
                             sentence_label_ids.extend([-100] * (len(word_tokens) - 1))
                             
-                    # 3. Ghép nối chuẩn xác: [CLS] Prompt [SEP] Sentence [SEP]
+                    # 3. Ghép nối: [CLS] Prompt [SEP] Sentence [SEP]
                     input_ids = [tokenizer.cls_token_id] + prompt_tokens + [tokenizer.sep_token_id] + sentence_input_ids + [tokenizer.sep_token_id]
-                    
-                    # Label cho phần prompt và các token đặc biệt là -100 (Không tính Loss)
                     label_ids = [-100] * (len(prompt_tokens) + 2) + sentence_label_ids + [-100]
                     
-                    # Cắt gọt và Padding theo max_len
+                    # Padding và chuẩn hóa độ dài...
                     input_ids = input_ids[:max_len]
                     label_ids = label_ids[:max_len]
                     
